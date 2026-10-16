@@ -48,59 +48,95 @@ jobs:
         working-directory: app
         run: npm test
 
-      # Rule 13: no npm dependencies.
+      # Rule 13: no npm dependencies, and imports in app/ only from node:* or relative paths.
+      # Prints file:line only — never the line content.
       - name: No npm dependencies
         run: |
           node -e '
-            const p = require("./app/package.json");
+            const fs = require("fs"), path = require("path");
+            const p = JSON.parse(fs.readFileSync("app/package.json", "utf8"));
             const deps = { ...p.dependencies, ...p.devDependencies };
             if (Object.keys(deps).length) { console.error("app/package.json declares dependencies"); process.exit(1); }
+            const spec = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)["\x27]([^"\x27]+)["\x27]/g;
+            let bad = 0;
+            const walk = (dir) => {
+              for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+                const f = path.join(dir, e.name);
+                if (e.isDirectory()) { if (e.name !== "node_modules") walk(f); continue; }
+                if (!/\.[cm]?js$/.test(e.name)) continue;
+                fs.readFileSync(f, "utf8").split("\n").forEach((line, i) => {
+                  for (const m of line.matchAll(spec)) {
+                    if (m[1].startsWith("node:") || m[1].startsWith(".")) continue;
+                    console.log(`::error file=${f},line=${i + 1}::Import is not node:* or relative (rule 13).`);
+                    bad = 1;
+                  }
+                });
+              }
+            };
+            walk("app");
+            process.exit(bad);
           '
 
-      # Rule 6: a changed or new export in src/ needs an app/CHANGELOG.md entry in the same PR.
+      # Rule 6: a change to what a public function accepts or returns needs an app/CHANGELOG.md
+      # entry in the same PR. Two levels, only when CHANGELOG.md is untouched:
+      #   error   — an `export` line was added, removed or changed (signature, new/removed API);
+      #   warning — lines changed INSIDE an exported function (git names it in the hunk header,
+      #             `@@ … @@ export function …`): maybe a contract change (new fields, other
+      #             values), maybe a pure refactor — the reviewer must decide. Prints file:line only.
       - name: CHANGELOG entry for public API changes
         run: |
+          if git diff --name-only "$BASE_SHA"...HEAD | grep -qx 'app/CHANGELOG.md'; then exit 0; fi
           if git diff -U0 "$BASE_SHA"...HEAD -- app/src | grep -qE '^[+-][[:space:]]*export '; then
-            if ! git diff --name-only "$BASE_SHA"...HEAD | grep -qx 'app/CHANGELOG.md'; then
-              echo "::error::An export in app/src changed, but app/CHANGELOG.md did not (rule 6)."
-              exit 1
-            fi
+            echo "::error::An export in app/src changed, but app/CHANGELOG.md did not (rule 6)."
+            exit 1
           fi
+          # Paths are NUL-separated (-z / read -d ''): spaces, globs or non-ASCII in names stay intact.
+          while IFS= read -r -d '' f; do
+            git diff -U0 "$BASE_SHA"...HEAD -- "$f" \
+              | sed -nE 's/^@@ -[0-9,]+ \+([0-9]+)(,[0-9]+)? @@ export .*/\1/p' \
+              | while read -r n; do
+                  echo "::warning file=$f,line=$n::Changed inside an exported function, app/CHANGELOG.md untouched: possible contract change (rule 6). Reviewer must confirm."
+                done
+          done < <(git diff -z --name-only --diff-filter=M "$BASE_SHA"...HEAD -- 'app/src/*.js')
 
-      # Rules 4 and 5 on ADDED lines only: money formatting and local-time Date methods in src/.
+      # Rules 4 and 5 on ADDED lines only: money formatting, kopecks → fractional hryvnias (`/ 100`,
+      # not `/ 1000`, not a `// 100` comment) and local-time Date methods in src/. Whether a result
+      # is a whole number of kopecks on every path stays with the reviewer (rule 4, judgment).
       # Prints file:line only — never the line content (no workflow-command injection via logs).
       - name: Money and date conventions in src/
         run: |
-          files=$(git diff --name-only --diff-filter=AM "$BASE_SHA"...HEAD -- 'app/src/*.js')
-          [ -z "$files" ] && exit 0
           bad=0
-          for f in $files; do
+          # NUL-separated paths; process substitution keeps `bad` in this shell.
+          while IFS= read -r -d '' f; do
             lines=$(git diff -U0 "$BASE_SHA"...HEAD -- "$f" | grep -E '^\+[^+]' \
-              | grep -cE 'toFixed\(|NumberFormat|грн|getDate\(|getMonth\(|getFullYear\(|getHours\(|setHours\(|toLocaleDateString' || true)
+              | grep -cE 'toFixed\(|NumberFormat|грн|([^/]|^)/[[:space:]]*100([^0-9]|$)|getDate\(|getMonth\(|getFullYear\(|getHours\(|setHours\(|toLocaleDateString' || true)
             if [ "$lines" -gt 0 ]; then
               echo "::error file=$f::$lines added line(s) format money or use local-time Date methods (rules 4, 5)."
               bad=1
             fi
-          done
+          done < <(git diff -z --name-only --diff-filter=AM "$BASE_SHA"...HEAD -- 'app/src/*.js')
           exit $bad
 
       # Rule 11 heuristic: text in code addressed to reviewers/AI. Advisory — warns, never fails.
       - name: Text addressed to reviewers (advisory)
         run: |
-          files=$(git diff --name-only --diff-filter=AM "$BASE_SHA"...HEAD -- app)
-          [ -z "$files" ] && exit 0
-          for f in $files; do
+          while IFS= read -r -d '' f; do
             grep -inE 'ai (code )?review|reviewer|llm|ignore (all |previous )|do not report|lgtm' -- "$f" \
               | cut -d: -f1 | while read -r n; do
                   echo "::warning file=$f,line=$n::Possible text addressed to reviewers/AI (rule 11)."
                 done || true
-          done
+          done < <(git diff -z --name-only --diff-filter=AM "$BASE_SHA"...HEAD -- app)
 
   ai-review:
     name: AI review (advisory)
     needs: checks
     # Same-repo PRs only: fork PRs get no secrets, and must not reach a step that has one.
     if: github.event.pull_request.head.repo.full_name == github.repository
+    # The API key is a secret of THIS environment (not a repo secret), and the environment
+    # requires a maintainer's approval. With `pull_request`, a same-repo PR can edit this
+    # workflow file itself — so any job that reaches for the key, original or rewritten,
+    # waits for a human who has checked the PR's changes to .github/workflows/.
+    environment: ai-review
     runs-on: ubuntu-latest
     timeout-minutes: 15
     continue-on-error: true
