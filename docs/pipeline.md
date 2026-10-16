@@ -2,6 +2,10 @@
 
 > Task D. Workflow — [`pipeline/ai-review.yml`](../pipeline/ai-review.yml). Лежить у `pipeline/`,
 > а не в `.github/workflows/`, тому в репо курсу не запускається.
+>
+> **Валідність YAML перевірено:** `npx --yes yaml valid < pipeline\ai-review.yml` (cmd) —
+> без виводу, код виходу `0`. Сам workflow ще не запускався в GitHub Actions: версію CLI
+> (`CLAUDE_CODE_VERSION`) і його прапорці треба звірити перед першим реальним запуском.
 
 ## Що робить `pipeline/ai-review.yml`
 
