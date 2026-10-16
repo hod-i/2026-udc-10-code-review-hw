@@ -64,13 +64,15 @@ jobs:
                 const f = path.join(dir, e.name);
                 if (e.isDirectory()) { if (e.name !== "node_modules") walk(f); continue; }
                 if (!/\.[cm]?js$/.test(e.name)) continue;
-                fs.readFileSync(f, "utf8").split("\n").forEach((line, i) => {
-                  for (const m of line.matchAll(spec)) {
-                    if (m[1].startsWith("node:") || m[1].startsWith(".")) continue;
-                    console.log(`::error file=${f},line=${i + 1}::Import is not node:* or relative (rule 13).`);
-                    bad = 1;
-                  }
-                });
+                // Whole file, so imports split across lines (`require(\n "x"\n)`) are caught too;
+                // the line number is that of the keyword, from the match position.
+                const text = fs.readFileSync(f, "utf8");
+                for (const m of text.matchAll(spec)) {
+                  if (m[1].startsWith("node:") || m[1].startsWith(".")) continue;
+                  const line = text.slice(0, m.index).split("\n").length;
+                  console.log(`::error file=${f},line=${line}::Import is not node:* or relative (rule 13).`);
+                  bad = 1;
+                }
               }
             };
             walk("app");
